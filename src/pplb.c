@@ -110,7 +110,7 @@ static int get_mac(const char *ifname, uint8_t *mac)
     if (fd < 0) return -1;
 
     struct ifreq ifr = {0};
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
 
     if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
         close(fd);
@@ -126,7 +126,7 @@ static int get_peer_mac(const char *ifname, const char *ip, uint8_t *mac)
 {
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "ping -c1 -W1 -I %s %s >/dev/null 2>&1", ifname, ip);
-    system(cmd);
+    (void)system(cmd);  /* Ignore return value */
 
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
@@ -135,7 +135,7 @@ static int get_peer_mac(const char *ifname, const char *ip, uint8_t *mac)
     struct sockaddr_in *sin = (struct sockaddr_in *)&arp.arp_pa;
     sin->sin_family = AF_INET;
     inet_pton(AF_INET, ip, &sin->sin_addr);
-    strncpy(arp.arp_dev, ifname, 15);
+    snprintf(arp.arp_dev, sizeof(arp.arp_dev), "%s", ifname);
 
     if (ioctl(fd, SIOCGARP, &arp) < 0) {
         close(fd);
@@ -166,7 +166,7 @@ static int load_config(const char *path)
         if (n < 2) continue;
 
         if (strcmp(key, "local") == 0) {
-            strncpy(local_if, val1, sizeof(local_if) - 1);
+            snprintf(local_if, sizeof(local_if), "%s", val1);
             local_ifindex = if_nametoindex(val1);
             if (!local_ifindex) {
                 fprintf(stderr, "Interface not found: %s\n", val1);
@@ -188,7 +188,7 @@ static int load_config(const char *path)
             printf("  REMOTE: %s/%d\n", val1, prefix);
 
         } else if (strcmp(key, "wan") == 0 && num_wan < MAX_WAN) {
-            strncpy(wan_if[num_wan], val1, sizeof(wan_if[num_wan]) - 1);
+            snprintf(wan_if[num_wan], sizeof(wan_if[num_wan]), "%s", val1);
             wan_ifindex[num_wan] = if_nametoindex(val1);
             if (!wan_ifindex[num_wan]) {
                 fprintf(stderr, "Interface not found: %s\n", val1);
@@ -272,8 +272,8 @@ static int attach_xdp(const char *bpf_path, int ifindex, uint32_t direction,
     bpf_map_update_elem(cfg_map_fd, &key, &val, BPF_ANY);
 
     int prog_fd = bpf_program__fd(prog);
-    if (bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_DRV_MODE, NULL) < 0) {
-        if (bpf_xdp_attach(ifindex, prog_fd, XDP_FLAGS_SKB_MODE, NULL) < 0) {
+    if (bpf_set_link_xdp_fd(ifindex, prog_fd, XDP_FLAGS_DRV_MODE) < 0) {
+        if (bpf_set_link_xdp_fd(ifindex, prog_fd, XDP_FLAGS_SKB_MODE) < 0) {
             bpf_object__close(obj);
             return -1;
         }
@@ -467,8 +467,8 @@ static void cleanup(void)
     print_stats();
 
     if (local_ifindex) {
-        bpf_xdp_detach(local_ifindex, XDP_FLAGS_DRV_MODE, NULL);
-        bpf_xdp_detach(local_ifindex, XDP_FLAGS_SKB_MODE, NULL);
+        bpf_set_link_xdp_fd(local_ifindex, -1, XDP_FLAGS_DRV_MODE);
+        bpf_set_link_xdp_fd(local_ifindex, -1, XDP_FLAGS_SKB_MODE);
     }
     if (local_xsk) xsk_socket__delete(local_xsk);
     if (local_umem) xsk_umem__delete(local_umem);
@@ -478,8 +478,8 @@ static void cleanup(void)
 
     for (int i = 0; i < num_wan; i++) {
         if (wan_ifindex[i]) {
-            bpf_xdp_detach(wan_ifindex[i], XDP_FLAGS_DRV_MODE, NULL);
-            bpf_xdp_detach(wan_ifindex[i], XDP_FLAGS_SKB_MODE, NULL);
+            bpf_set_link_xdp_fd(wan_ifindex[i], -1, XDP_FLAGS_DRV_MODE);
+            bpf_set_link_xdp_fd(wan_ifindex[i], -1, XDP_FLAGS_SKB_MODE);
         }
         if (wan_xsk[i]) xsk_socket__delete(wan_xsk[i]);
         if (wan_umem[i]) xsk_umem__delete(wan_umem[i]);
