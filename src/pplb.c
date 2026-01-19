@@ -147,6 +147,17 @@ static int get_peer_mac(const char *ifname, const char *ip, uint8_t *mac)
     return 0;
 }
 
+/* Parse MAC address string to bytes */
+static int parse_mac(const char *str, uint8_t *mac)
+{
+    unsigned int m[6];
+    if (sscanf(str, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6)
+        return -1;
+    for (int i = 0; i < 6; i++)
+        mac[i] = (uint8_t)m[i];
+    return 0;
+}
+
 /* ============ Config ============ */
 static int load_config(const char *path)
 {
@@ -156,13 +167,14 @@ static int load_config(const char *path)
         return -1;
     }
 
-    char line[256], key[32], val1[64], val2[64];
+    char line[256], key[32], val1[64], val2[64], val3[32];
 
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
 
         val2[0] = 0;
-        int n = sscanf(line, "%31s %63s %63s", key, val1, val2);
+        val3[0] = 0;
+        int n = sscanf(line, "%31s %63s %63s %31s", key, val1, val2, val3);
         if (n < 2) continue;
 
         if (strcmp(key, "local") == 0) {
@@ -174,7 +186,9 @@ static int load_config(const char *path)
                 return -1;
             }
             get_mac(val1, local_mac);
-            printf("  LOCAL: %s\n", local_if);
+            printf("  LOCAL: %s (%02x:%02x:%02x:%02x:%02x:%02x)\n", local_if,
+                   local_mac[0], local_mac[1], local_mac[2],
+                   local_mac[3], local_mac[4], local_mac[5]);
 
         } else if (strcmp(key, "remote") == 0) {
             char *slash = strchr(val1, '/');
@@ -197,13 +211,17 @@ static int load_config(const char *path)
             }
             get_mac(val1, wan_src_mac[num_wan]);
 
-            if (val2[0]) {
+            /* Parse peer MAC from config (val3) or get via ARP */
+            if (val3[0] && parse_mac(val3, wan_dst_mac[num_wan]) == 0) {
+                /* MAC from config */
+                printf("  WAN%d: %s -> %s [%s]\n", num_wan + 1, wan_if[num_wan], val2, val3);
+            } else if (val2[0]) {
+                /* Get MAC via ARP */
                 get_peer_mac(val1, val2, wan_dst_mac[num_wan]);
+                printf("  WAN%d: %s -> %s [ARP]\n", num_wan + 1, wan_if[num_wan], val2);
+            } else {
+                printf("  WAN%d: %s\n", num_wan + 1, wan_if[num_wan]);
             }
-
-            printf("  WAN%d: %s", num_wan + 1, wan_if[num_wan]);
-            if (val2[0]) printf(" -> %s", val2);
-            printf("\n");
 
             num_wan++;
         }
