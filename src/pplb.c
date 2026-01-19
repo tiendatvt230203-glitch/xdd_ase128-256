@@ -168,10 +168,7 @@ static int setup_bpf(const char *ifname, const char *bpf_path,
     /* Find program */
     struct bpf_program *prog = bpf_object__find_program_by_name(*obj, "xdp_redirect_prog");
     if (!prog) {
-        prog = bpf_object__next_program(*obj, NULL);
-    }
-    if (!prog) {
-        fprintf(stderr, "No XDP program found\n");
+        fprintf(stderr, "XDP program 'xdp_redirect_prog' not found\n");
         return -1;
     }
     *prog_fd = bpf_program__fd(prog);
@@ -197,9 +194,9 @@ static int setup_bpf(const char *ifname, const char *bpf_path,
         printf("    Filter: net=0x%08x mask=0x%08x dir=%u\n", filter_net, filter_mask, direction);
     }
 
-    /* Attach XDP */
+    /* Attach XDP using older API */
     int ifindex = if_nametoindex(ifname);
-    if (bpf_xdp_attach(ifindex, *prog_fd, XDP_FLAGS_SKB_MODE, NULL) < 0) {
+    if (bpf_set_link_xdp_fd(ifindex, *prog_fd, XDP_FLAGS_SKB_MODE) < 0) {
         fprintf(stderr, "Failed to attach XDP to %s\n", ifname);
         return -1;
     }
@@ -396,9 +393,9 @@ static void cleanup(void) {
 
     int ifindex;
     ifindex = if_nametoindex(local_if);
-    if (ifindex > 0) bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, NULL);
+    if (ifindex > 0) bpf_set_link_xdp_fd(ifindex, -1, XDP_FLAGS_SKB_MODE);
     ifindex = if_nametoindex(wan_if[selected_wan]);
-    if (ifindex > 0) bpf_xdp_detach(ifindex, XDP_FLAGS_SKB_MODE, NULL);
+    if (ifindex > 0) bpf_set_link_xdp_fd(ifindex, -1, XDP_FLAGS_SKB_MODE);
 
     if (local_xsk) xsk_socket__delete(local_xsk);
     if (local_umem) xsk_umem__delete(local_umem);
@@ -513,3 +510,4 @@ int main(int argc, char **argv) {
     printf("Done.\n");
     return 0;
 }
+
