@@ -1,59 +1,40 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/*
- * Per-Window Load Balancer (PPLB)
- *
- * Load balance packets across multiple WAN interfaces per-window
- * to avoid reordering issues.
- *
- * Usage: sudo ./pplb <config_file> [xdp_redirect.o]
- */
-
 #define _GNU_SOURCE
 #include <errno.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdarg.h>
 #include <time.h>
 #include <net/if.h>
 #include <net/if_arp.h>
-#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
-#include <linux/if_packet.h>
 #include <linux/ip.h>
 #include <arpa/inet.h>
 
 #include <bpf/bpf.h>
 #include <bpf/libbpf.h>
-#include <xdp/xsk.h>
+#include <bpf/xsk.h>
 
-/* ============ Configuration ============ */
-#define MAX_WAN             3
-#define NUM_FRAMES          4096
-#define FRAME_SIZE          XSK_UMEM__DEFAULT_FRAME_SIZE
-#define BATCH_SIZE          64
-#define WINDOW_SIZE         (1024 * 1024)  /* 1MB window */
-#define FLOW_TABLE_SIZE     65536
+#ifndef ENOTSUPP
+#define ENOTSUPP 524
+#endif
 
-/* ============ Data Structures ============ */
-struct flow_entry {
-    uint32_t bytes;
-    int wan_idx;
-};
+#define MAX_WAN      3
+#define NUM_FRAMES   4096
+#define FRAME_SIZE   XSK_UMEM__DEFAULT_FRAME_SIZE
+#define BATCH_SIZE   64
 
-/* ============ Global State ============ */
 static volatile int running = 1;
 
 /* Config */
 static char local_if[32];
 static int local_ifindex;
-static uint32_t remote_net, remote_mask;
 static int num_wan = 0;
 static char wan_if[MAX_WAN][32];
 static int wan_ifindex[MAX_WAN];
@@ -61,255 +42,147 @@ static uint8_t local_mac[6];
 static uint8_t wan_src_mac[MAX_WAN][6];
 static uint8_t wan_dst_mac[MAX_WAN][6];
 
-/* Raw sockets for TX */
-static int local_raw_fd;
-static int wan_raw_fd[MAX_WAN];
-
-/* BPF objects */
+/* LOCAL - giống recv.c */
 static struct bpf_object *local_bpf_obj;
-static struct bpf_object *wan_bpf_obj[MAX_WAN];
-
-/* AF_XDP for LOCAL */
+static int local_xsks_map_fd;
 static struct xsk_socket *local_xsk;
 static struct xsk_ring_cons local_rx;
+static struct xsk_ring_prod local_tx;
 static struct xsk_ring_prod local_fq;
+static struct xsk_ring_cons local_cq;
 static struct xsk_umem *local_umem;
-static void *local_buffer;
+static void *local_buf;
 
-/* AF_XDP for WANs */
+/* WAN - giống sender.c */
 static struct xsk_socket *wan_xsk[MAX_WAN];
 static struct xsk_ring_cons wan_rx[MAX_WAN];
+static struct xsk_ring_prod wan_tx[MAX_WAN];
 static struct xsk_ring_prod wan_fq[MAX_WAN];
+static struct xsk_ring_cons wan_cq[MAX_WAN];
 static struct xsk_umem *wan_umem[MAX_WAN];
-static void *wan_buffer[MAX_WAN];
+static void *wan_buf[MAX_WAN];
 
-/* Flow table */
-static struct flow_entry flow_table[FLOW_TABLE_SIZE];
+static int selected_wan = 0;
+static uint64_t rx_count = 0, tx_count = 0;
 
-/* Statistics */
-static uint64_t rx_local = 0, tx_local = 0;
-static uint64_t rx_wan[MAX_WAN] = {0}, tx_wan[MAX_WAN] = {0};
-static uint64_t window_switches = 0;
+static void die(const char *m) { perror(m); exit(1); }
+static void sig_handler(int s) { (void)s; running = 0; }
 
-/* ============ Utility Functions ============ */
-static void die(const char *msg)
-{
-    fprintf(stderr, "ERROR: %s: %s\n", msg, strerror(errno));
-    exit(1);
+static int silent_print(enum libbpf_print_level l, const char *f, va_list a) {
+    (void)l; (void)f; (void)a; return 0;
 }
 
-static void signal_handler(int sig)
-{
-    (void)sig;
-    running = 0;
-}
-
-static int get_mac(const char *ifname, uint8_t *mac)
-{
+static int get_mac(const char *ifname, uint8_t *mac) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-
     struct ifreq ifr = {0};
-    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", ifname);
-
-    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
-        close(fd);
-        return -1;
-    }
-
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ-1);
+    ioctl(fd, SIOCGIFHWADDR, &ifr);
     close(fd);
     memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
     return 0;
 }
 
-static int get_peer_mac(const char *ifname, const char *ip, uint8_t *mac)
-{
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "ping -c1 -W1 -I %s %s >/dev/null 2>&1", ifname, ip);
-    (void)system(cmd);  /* Ignore return value */
-
-    int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return -1;
-
-    struct arpreq arp = {0};
-    struct sockaddr_in *sin = (struct sockaddr_in *)&arp.arp_pa;
-    sin->sin_family = AF_INET;
-    inet_pton(AF_INET, ip, &sin->sin_addr);
-    snprintf(arp.arp_dev, sizeof(arp.arp_dev), "%s", ifname);
-
-    if (ioctl(fd, SIOCGARP, &arp) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    close(fd);
-    memcpy(mac, arp.arp_ha.sa_data, 6);
-    return 0;
-}
-
-/* Parse MAC address string to bytes */
-static int parse_mac(const char *str, uint8_t *mac)
-{
+static int parse_mac(const char *str, uint8_t *mac) {
     unsigned int m[6];
-    if (sscanf(str, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6)
+    if (sscanf(str, "%x:%x:%x:%x:%x:%x", &m[0],&m[1],&m[2],&m[3],&m[4],&m[5]) != 6)
         return -1;
-    for (int i = 0; i < 6; i++)
-        mac[i] = (uint8_t)m[i];
+    for (int i = 0; i < 6; i++) mac[i] = m[i];
     return 0;
 }
 
-/* ============ Config ============ */
-static int load_config(const char *path)
-{
+static int load_config(const char *path) {
     FILE *f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "Cannot open config: %s\n", path);
-        return -1;
-    }
-
-    char line[256], key[32], val1[64], val2[64], val3[32];
-
+    if (!f) return -1;
+    char line[256], key[32], v1[64], v2[64], v3[32];
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
-
-        val2[0] = 0;
-        val3[0] = 0;
-        int n = sscanf(line, "%31s %63s %63s %31s", key, val1, val2, val3);
-        if (n < 2) continue;
-
-        if (strcmp(key, "local") == 0) {
-            snprintf(local_if, sizeof(local_if), "%s", val1);
-            local_ifindex = if_nametoindex(val1);
-            if (!local_ifindex) {
-                fprintf(stderr, "Interface not found: %s\n", val1);
-                fclose(f);
-                return -1;
-            }
-            get_mac(val1, local_mac);
-            printf("  LOCAL: %s (%02x:%02x:%02x:%02x:%02x:%02x)\n", local_if,
-                   local_mac[0], local_mac[1], local_mac[2],
-                   local_mac[3], local_mac[4], local_mac[5]);
-
-        } else if (strcmp(key, "remote") == 0) {
-            char *slash = strchr(val1, '/');
-            int prefix = 24;
-            if (slash) {
-                *slash = 0;
-                prefix = atoi(slash + 1);
-            }
-            remote_net = ntohl(inet_addr(val1));
-            remote_mask = (prefix == 0) ? 0 : (0xFFFFFFFF << (32 - prefix));
-            printf("  REMOTE: %s/%d\n", val1, prefix);
-
-        } else if (strcmp(key, "wan") == 0 && num_wan < MAX_WAN) {
-            snprintf(wan_if[num_wan], sizeof(wan_if[num_wan]), "%s", val1);
-            wan_ifindex[num_wan] = if_nametoindex(val1);
-            if (!wan_ifindex[num_wan]) {
-                fprintf(stderr, "Interface not found: %s\n", val1);
-                fclose(f);
-                return -1;
-            }
-            get_mac(val1, wan_src_mac[num_wan]);
-
-            /* Parse peer MAC from config (val3) or get via ARP */
-            if (val3[0] && parse_mac(val3, wan_dst_mac[num_wan]) == 0) {
-                /* MAC from config */
-                printf("  WAN%d: %s -> %s [%s]\n", num_wan + 1, wan_if[num_wan], val2, val3);
-            } else if (val2[0]) {
-                /* Get MAC via ARP */
-                get_peer_mac(val1, val2, wan_dst_mac[num_wan]);
-                printf("  WAN%d: %s -> %s [ARP]\n", num_wan + 1, wan_if[num_wan], val2);
-            } else {
-                printf("  WAN%d: %s\n", num_wan + 1, wan_if[num_wan]);
-            }
-
+        v2[0] = v3[0] = 0;
+        sscanf(line, "%s %s %s %s", key, v1, v2, v3);
+        if (!strcmp(key, "local")) {
+            strcpy(local_if, v1);
+            local_ifindex = if_nametoindex(v1);
+            get_mac(v1, local_mac);
+        } else if (!strcmp(key, "wan") && num_wan < MAX_WAN) {
+            strcpy(wan_if[num_wan], v1);
+            wan_ifindex[num_wan] = if_nametoindex(v1);
+            get_mac(v1, wan_src_mac[num_wan]);
+            if (v3[0]) parse_mac(v3, wan_dst_mac[num_wan]);
             num_wan++;
         }
     }
-
     fclose(f);
+    return (local_ifindex && num_wan > 0) ? 0 : -1;
+}
 
-    if (!local_ifindex || num_wan == 0) {
-        fprintf(stderr, "Config incomplete\n");
+/* ========== LOCAL SETUP - giống recv.c ========== */
+static int setup_local(const char *bpf_path) {
+    libbpf_set_print(silent_print);
+
+    /* Load BPF object - giống recv.c */
+    local_bpf_obj = bpf_object__open_file(bpf_path, NULL);
+    if (!local_bpf_obj || bpf_object__load(local_bpf_obj)) {
+        fprintf(stderr, "Failed to load BPF: %s\n", bpf_path);
         return -1;
     }
 
+    local_xsks_map_fd = bpf_object__find_map_fd_by_name(local_bpf_obj, "xsks_map");
+    if (local_xsks_map_fd < 0) {
+        fprintf(stderr, "xsks_map not found\n");
+        return -1;
+    }
+
+    /* Allocate UMEM */
+    if (posix_memalign(&local_buf, getpagesize(), NUM_FRAMES * FRAME_SIZE))
+        die("memalign");
+
+    struct xsk_umem_config ucfg = {
+        .fill_size = NUM_FRAMES,
+        .comp_size = NUM_FRAMES,
+        .frame_size = FRAME_SIZE,
+    };
+    if (xsk_umem__create(&local_umem, local_buf, NUM_FRAMES * FRAME_SIZE,
+                         &local_fq, &local_cq, &ucfg))
+        die("umem");
+
+    /* Fill ring init */
+    __u32 idx;
+    xsk_ring_prod__reserve(&local_fq, NUM_FRAMES, &idx);
+    for (__u32 i = 0; i < NUM_FRAMES; i++)
+        *xsk_ring_prod__fill_addr(&local_fq, idx + i) = i * FRAME_SIZE;
+    xsk_ring_prod__submit(&local_fq, NUM_FRAMES);
+
+    /* Create XSK socket - giống recv.c dùng create_shared */
+    struct xsk_socket_config xcfg = {
+        .rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+        .tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
+        .bind_flags = XDP_COPY,
+    };
+
+    int ret = xsk_socket__create_shared(&local_xsk, local_if, 0, local_umem,
+                                        &local_rx, &local_tx, &local_fq, &local_cq, &xcfg);
+    if (ret) {
+        if (-ret == ENOTSUPP) return 0;
+        errno = -ret;
+        die("xsk_socket local");
+    }
+
+    /* Update XSKMAP - giống recv.c */
+    int fd = xsk_socket__fd(local_xsk);
+    __u32 key = 0;
+    if (bpf_map_update_elem(local_xsks_map_fd, &key, &fd, 0))
+        die("map_update");
+
+    printf("LOCAL %s: XSK ready\n", local_if);
     return 0;
 }
 
-/* ============ Raw Socket ============ */
-static int create_raw_socket(int ifindex)
-{
-    int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (fd < 0) return -1;
+/* ========== WAN SETUP - giống sender.c ========== */
+static int setup_wan(int w) {
+    const char *ifname = wan_if[w];
 
-    struct sockaddr_ll sll = {0};
-    sll.sll_family = AF_PACKET;
-    sll.sll_ifindex = ifindex;
-    sll.sll_protocol = htons(ETH_P_ALL);
-
-    if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-        close(fd);
-        return -1;
-    }
-
-    return fd;
-}
-
-/* ============ XDP/AF_XDP ============ */
-static int attach_xdp(const char *bpf_path, int ifindex, uint32_t direction,
-                      struct bpf_object **obj_out, int *xsk_map_fd)
-{
-    struct bpf_object *obj = bpf_object__open_file(bpf_path, NULL);
-    if (libbpf_get_error(obj)) return -1;
-
-    if (bpf_object__load(obj)) {
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    struct bpf_program *prog = bpf_object__find_program_by_name(obj, "xdp_redirect_prog");
-    if (!prog) {
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    int cfg_map_fd = bpf_object__find_map_fd_by_name(obj, "config");
-    *xsk_map_fd = bpf_object__find_map_fd_by_name(obj, "xsks_map");
-
-    if (cfg_map_fd < 0 || *xsk_map_fd < 0) {
-        bpf_object__close(obj);
-        return -1;
-    }
-
-    uint32_t key = 0, val = remote_net;
-    bpf_map_update_elem(cfg_map_fd, &key, &val, BPF_ANY);
-    key = 1; val = remote_mask;
-    bpf_map_update_elem(cfg_map_fd, &key, &val, BPF_ANY);
-    key = 2; val = direction;
-    bpf_map_update_elem(cfg_map_fd, &key, &val, BPF_ANY);
-
-    int prog_fd = bpf_program__fd(prog);
-    if (bpf_set_link_xdp_fd(ifindex, prog_fd, XDP_FLAGS_DRV_MODE) < 0) {
-        if (bpf_set_link_xdp_fd(ifindex, prog_fd, XDP_FLAGS_SKB_MODE) < 0) {
-            bpf_object__close(obj);
-            return -1;
-        }
-    }
-
-    *obj_out = obj;
-    return 0;
-}
-
-static int setup_xsk(const char *ifname, int xsk_map_fd,
-                     struct xsk_socket **xsk,
-                     struct xsk_ring_cons *rx,
-                     struct xsk_ring_prod *fq,
-                     struct xsk_umem **umem,
-                     void **buffer)
-{
-    if (posix_memalign(buffer, getpagesize(), NUM_FRAMES * FRAME_SIZE))
-        return -1;
+    /* Allocate UMEM */
+    if (posix_memalign(&wan_buf[w], getpagesize(), NUM_FRAMES * FRAME_SIZE))
+        die("memalign wan");
 
     struct xsk_umem_config ucfg = {
         .fill_size = NUM_FRAMES,
@@ -319,269 +192,198 @@ static int setup_xsk(const char *ifname, int xsk_map_fd,
         .flags = 0
     };
 
-    struct xsk_ring_prod fill_ring;
-    struct xsk_ring_cons comp_ring;
+    if (xsk_umem__create(&wan_umem[w], wan_buf[w], NUM_FRAMES * FRAME_SIZE,
+                         &wan_fq[w], &wan_cq[w], &ucfg))
+        die("umem wan");
 
-    if (xsk_umem__create(umem, *buffer, NUM_FRAMES * FRAME_SIZE,
-                         &fill_ring, &comp_ring, &ucfg)) {
-        free(*buffer);
-        return -1;
+    /* Fill ring init */
+    __u32 idx;
+    if (xsk_ring_prod__reserve(&wan_fq[w], NUM_FRAMES, &idx) == NUM_FRAMES) {
+        for (__u32 i = 0; i < NUM_FRAMES; i++)
+            *xsk_ring_prod__fill_addr(&wan_fq[w], idx + i) = i * FRAME_SIZE;
+        xsk_ring_prod__submit(&wan_fq[w], NUM_FRAMES);
     }
 
-    *fq = fill_ring;
-
-    struct xsk_socket_config xcfg = {
-        .rx_size = NUM_FRAMES,
-        .tx_size = NUM_FRAMES,
-        .libbpf_flags = XSK_LIBBPF_FLAGS__INHIBIT_PROG_LOAD,
-        .xdp_flags = 0,
-        .bind_flags = XDP_COPY
+    /* Create XSK socket - giống sender.c */
+    struct xsk_socket_config cfg = {
+        .rx_size = XSK_RING_CONS__DEFAULT_NUM_DESCS,
+        .tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS,
+        .libbpf_flags = 0,  /* libbpf tự attach XDP */
+        .xdp_flags = XDP_FLAGS_DRV_MODE,
+        .bind_flags = XDP_USE_NEED_WAKEUP | XDP_COPY,
     };
 
-    struct xsk_ring_prod tx_ring;
-    if (xsk_socket__create(xsk, ifname, 0, *umem, rx, &tx_ring, &xcfg)) {
-        xsk_umem__delete(*umem);
-        free(*buffer);
-        return -1;
-    }
-
-    int fd = xsk_socket__fd(*xsk);
-    uint32_t idx = 0;
-    bpf_map_update_elem(xsk_map_fd, &idx, &fd, BPF_ANY);
-
-    uint32_t fidx;
-    if (xsk_ring_prod__reserve(fq, NUM_FRAMES, &fidx) == NUM_FRAMES) {
-        for (uint32_t i = 0; i < NUM_FRAMES; i++)
-            *xsk_ring_prod__fill_addr(fq, fidx + i) = i * FRAME_SIZE;
-        xsk_ring_prod__submit(fq, NUM_FRAMES);
+    int ret = xsk_socket__create(&wan_xsk[w], ifname, 0, wan_umem[w],
+                                 &wan_rx[w], &wan_tx[w], &cfg);
+    if (ret) {
+        /* Fallback to SKB mode */
+        cfg.xdp_flags = XDP_FLAGS_SKB_MODE;
+        ret = xsk_socket__create(&wan_xsk[w], ifname, 0, wan_umem[w],
+                                 &wan_rx[w], &wan_tx[w], &cfg);
+        if (ret) {
+            errno = -ret;
+            die("xsk_socket wan");
+        }
+        printf("WAN%d %s: XSK ready (SKB)\n", w+1, ifname);
+    } else {
+        printf("WAN%d %s: XSK ready (DRV)\n", w+1, ifname);
     }
 
     return 0;
 }
 
-/* ============ Load Balancing ============ */
-static inline uint32_t calc_flow_hash(uint8_t *pkt)
-{
-    struct iphdr *ip = (struct iphdr *)(pkt + sizeof(struct ethhdr));
-    return (ip->saddr ^ ip->daddr) % FLOW_TABLE_SIZE;
+/* ========== TX to WAN - giống sender.c ========== */
+static int send_wan(int w, uint8_t *pkt, uint32_t len) {
+    /* Clean up completed TX - QUAN TRỌNG */
+    __u32 comp_idx;
+    unsigned int done = xsk_ring_cons__peek(&wan_cq[w], NUM_FRAMES, &comp_idx);
+    if (done > 0) xsk_ring_cons__release(&wan_cq[w], done);
+
+    /* Reserve TX slot */
+    __u32 tx_idx;
+    if (xsk_ring_prod__reserve(&wan_tx[w], 1, &tx_idx) != 1)
+        return -1;
+
+    /* Copy packet to frame 0 */
+    uint8_t *frame = xsk_umem__get_data(wan_buf[w], 0);
+    memcpy(frame, pkt, len);
+
+    /* Fill descriptor */
+    struct xdp_desc *d = xsk_ring_prod__tx_desc(&wan_tx[w], tx_idx);
+    d->addr = 0;
+    d->len = len;
+
+    xsk_ring_prod__submit(&wan_tx[w], 1);
+
+    /* Wakeup kernel */
+    if (xsk_ring_prod__needs_wakeup(&wan_tx[w]))
+        sendto(xsk_socket__fd(wan_xsk[w]), NULL, 0, MSG_DONTWAIT, NULL, 0);
+
+    return 0;
 }
 
-static int select_wan(uint8_t *pkt, uint32_t len)
-{
-    uint32_t hash = calc_flow_hash(pkt);
-    struct flow_entry *flow = &flow_table[hash];
+/* ========== Process LOCAL RX ========== */
+static void process_rx(void) {
+    __u32 rx_idx = 0;
+    unsigned int n = xsk_ring_cons__peek(&local_rx, BATCH_SIZE, &rx_idx);
+    if (!n) return;
 
-    int current_wan = flow->wan_idx;
+    __u32 fq_idx;
+    if (xsk_ring_prod__reserve(&local_fq, n, &fq_idx) == n) {
+        for (__u32 i = 0; i < n; i++) {
+            struct xdp_desc *d = (struct xdp_desc *)xsk_ring_cons__rx_desc(&local_rx, rx_idx + i);
+            uint8_t *pkt = xsk_umem__get_data(local_buf, d->addr);
+            uint32_t len = d->len;
 
-    flow->bytes += len;
+            rx_count++;
 
-    if (flow->bytes >= WINDOW_SIZE) {
-        flow->wan_idx = (flow->wan_idx + 1) % num_wan;
-        flow->bytes = 0;
-        window_switches++;
-    }
+            /* Đổi MAC cho WAN đã chọn */
+            memcpy(pkt, wan_dst_mac[selected_wan], 6);
+            memcpy(pkt + 6, wan_src_mac[selected_wan], 6);
 
-    return current_wan;
-}
+            /* Gửi ra WAN */
+            if (send_wan(selected_wan, pkt, len) == 0)
+                tx_count++;
 
-/* ============ Packet Processing ============ */
-
-/* LOCAL -> WANs */
-static void process_local_rx(void)
-{
-    uint32_t idx = 0;
-    uint32_t rcvd = xsk_ring_cons__peek(&local_rx, BATCH_SIZE, &idx);
-    if (rcvd == 0) return;
-
-    for (uint32_t i = 0; i < rcvd; i++) {
-        const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&local_rx, idx + i);
-        uint64_t addr = desc->addr;
-        uint32_t len = desc->len;
-        uint8_t *pkt = xsk_umem__get_data(local_buffer, addr);
-
-        rx_local++;
-
-        int w = select_wan(pkt, len);
-
-        /* Set MAC */
-        memcpy(pkt, wan_dst_mac[w], 6);
-        memcpy(pkt + 6, wan_src_mac[w], 6);
-
-        /* Send */
-        struct sockaddr_ll sll = {0};
-        sll.sll_family = AF_PACKET;
-        sll.sll_ifindex = wan_ifindex[w];
-        sll.sll_halen = 6;
-        memcpy(sll.sll_addr, wan_dst_mac[w], 6);
-
-        if (sendto(wan_raw_fd[w], pkt, len, 0,
-                   (struct sockaddr *)&sll, sizeof(sll)) > 0) {
-            tx_wan[w]++;
+            /* Return buffer */
+            *xsk_ring_prod__fill_addr(&local_fq, fq_idx + i) = d->addr & ~(FRAME_SIZE - 1);
         }
-
-        /* Return buffer */
-        uint32_t fidx;
-        if (xsk_ring_prod__reserve(&local_fq, 1, &fidx)) {
-            *xsk_ring_prod__fill_addr(&local_fq, fidx) = addr;
-            xsk_ring_prod__submit(&local_fq, 1);
-        }
+        xsk_ring_cons__release(&local_rx, n);
+        xsk_ring_prod__submit(&local_fq, n);
+    } else {
+        xsk_ring_cons__release(&local_rx, n);
+        usleep(10);
     }
-
-    xsk_ring_cons__release(&local_rx, rcvd);
 }
 
-/* WAN -> LOCAL */
-static void process_wan_rx(int w)
-{
-    uint32_t idx = 0;
-    uint32_t rcvd = xsk_ring_cons__peek(&wan_rx[w], BATCH_SIZE, &idx);
-    if (rcvd == 0) return;
+static void cleanup(void) {
+    printf("\nShutdown...\n");
+    printf("RX: %lu, TX: %lu\n", rx_count, tx_count);
 
-    for (uint32_t i = 0; i < rcvd; i++) {
-        const struct xdp_desc *desc = xsk_ring_cons__rx_desc(&wan_rx[w], idx + i);
-        uint64_t addr = desc->addr;
-        uint32_t len = desc->len;
-        uint8_t *pkt = xsk_umem__get_data(wan_buffer[w], addr);
-
-        rx_wan[w]++;
-
-        /* Forward to LOCAL */
-        struct sockaddr_ll sll = {0};
-        sll.sll_family = AF_PACKET;
-        sll.sll_ifindex = local_ifindex;
-
-        if (sendto(local_raw_fd, pkt, len, 0,
-                   (struct sockaddr *)&sll, sizeof(sll)) > 0) {
-            tx_local++;
-        }
-
-        /* Return buffer */
-        uint32_t fidx;
-        if (xsk_ring_prod__reserve(&wan_fq[w], 1, &fidx)) {
-            *xsk_ring_prod__fill_addr(&wan_fq[w], fidx) = addr;
-            xsk_ring_prod__submit(&wan_fq[w], 1);
-        }
-    }
-
-    xsk_ring_cons__release(&wan_rx[w], rcvd);
-}
-
-/* ============ Statistics ============ */
-static void print_stats(void)
-{
-    printf("\n=== PPLB Stats ===\n");
-    printf("LOCAL: RX %lu, TX %lu\n", rx_local, tx_local);
-    for (int i = 0; i < num_wan; i++) {
-        printf("WAN%d:  RX %lu, TX %lu\n", i + 1, rx_wan[i], tx_wan[i]);
-    }
-    printf("Window switches: %lu\n", window_switches);
-    printf("==================\n");
-}
-
-/* ============ Cleanup ============ */
-static void cleanup(void)
-{
-    printf("\nShutting down...\n");
-    print_stats();
-
-    if (local_ifindex) {
-        bpf_set_link_xdp_fd(local_ifindex, -1, XDP_FLAGS_DRV_MODE);
-        bpf_set_link_xdp_fd(local_ifindex, -1, XDP_FLAGS_SKB_MODE);
-    }
     if (local_xsk) xsk_socket__delete(local_xsk);
     if (local_umem) xsk_umem__delete(local_umem);
-    if (local_buffer) free(local_buffer);
+    if (local_buf) free(local_buf);
     if (local_bpf_obj) bpf_object__close(local_bpf_obj);
-    if (local_raw_fd > 0) close(local_raw_fd);
 
     for (int i = 0; i < num_wan; i++) {
-        if (wan_ifindex[i]) {
-            bpf_set_link_xdp_fd(wan_ifindex[i], -1, XDP_FLAGS_DRV_MODE);
-            bpf_set_link_xdp_fd(wan_ifindex[i], -1, XDP_FLAGS_SKB_MODE);
-        }
         if (wan_xsk[i]) xsk_socket__delete(wan_xsk[i]);
         if (wan_umem[i]) xsk_umem__delete(wan_umem[i]);
-        if (wan_buffer[i]) free(wan_buffer[i]);
-        if (wan_bpf_obj[i]) bpf_object__close(wan_bpf_obj[i]);
-        if (wan_raw_fd[i] > 0) close(wan_raw_fd[i]);
+        if (wan_buf[i]) free(wan_buf[i]);
     }
-
-    printf("Done.\n");
 }
 
-/* ============ Main ============ */
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     struct rlimit r = {RLIM_INFINITY, RLIM_INFINITY};
 
-    printf("=== Per-Window Load Balancer ===\n");
-    printf("Window size: %d bytes\n\n", WINDOW_SIZE);
+    printf("=== Tunnel (1 chiều: LOCAL -> WAN) ===\n\n");
 
     if (argc < 2) {
-        printf("Usage: %s <config> [xdp.o]\n", argv[0]);
+        printf("Usage: %s <config> [wan_index] [xdp_kern.o]\n", argv[0]);
+        printf("  wan_index: 0, 1, 2 (default: 0)\n");
         return 1;
     }
 
-    if (setrlimit(RLIMIT_MEMLOCK, &r)) die("setrlimit");
+    if (argc >= 3 && argv[2][0] >= '0' && argv[2][0] <= '9')
+        selected_wan = atoi(argv[2]);
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    libbpf_set_print(NULL);
+    if (setrlimit(RLIMIT_MEMLOCK, &r)) die("setrlimit");
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
 
     printf("[CONFIG]\n");
-    if (load_config(argv[1]) < 0) return 1;
+    if (load_config(argv[1]) < 0) die("config");
 
-    const char *bpf_path = (argc >= 3) ? argv[2] : "xdp/xdp_redirect.o";
-
-    /* Raw sockets */
-    local_raw_fd = create_raw_socket(local_ifindex);
-    if (local_raw_fd < 0) die("local raw socket");
-
-    for (int i = 0; i < num_wan; i++) {
-        wan_raw_fd[i] = create_raw_socket(wan_ifindex[i]);
-        if (wan_raw_fd[i] < 0) die("wan raw socket");
+    if (selected_wan >= num_wan) {
+        fprintf(stderr, "Invalid WAN %d\n", selected_wan);
+        return 1;
     }
 
-    /* Setup LOCAL */
-    int local_xsk_map;
-    if (attach_xdp(bpf_path, local_ifindex, 0, &local_bpf_obj, &local_xsk_map) < 0)
-        die("attach xdp local");
-    if (setup_xsk(local_if, local_xsk_map, &local_xsk, &local_rx, &local_fq,
-                  &local_umem, &local_buffer) < 0)
-        die("setup xsk local");
-    printf("[OK] LOCAL ready\n");
-
-    /* Setup WANs */
+    printf("  LOCAL: %s\n", local_if);
     for (int i = 0; i < num_wan; i++) {
-        int wan_xsk_map;
-        if (attach_xdp(bpf_path, wan_ifindex[i], 1, &wan_bpf_obj[i], &wan_xsk_map) < 0)
-            die("attach xdp wan");
-        if (setup_xsk(wan_if[i], wan_xsk_map, &wan_xsk[i], &wan_rx[i], &wan_fq[i],
-                      &wan_umem[i], &wan_buffer[i]) < 0)
-            die("setup xsk wan");
-        printf("[OK] WAN%d ready\n", i + 1);
+        printf("  WAN%d: %s %s\n", i+1, wan_if[i],
+               i == selected_wan ? "<-- selected" : "");
     }
 
-    printf("\n[RUNNING] Press Ctrl+C to stop\n");
+    const char *bpf = (argc >= 4) ? argv[3] : "xdp_kern.o";
 
-    /* Main loop */
-    time_t last_stats = 0;
+    printf("\n[SETUP]\n");
+
+    /* QUAN TRỌNG: Phải attach XDP vào LOCAL trước */
+    printf("Attaching XDP to %s...\n", local_if);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ip link set dev %s xdp obj %s 2>/dev/null || "
+             "ip link set dev %s xdpgeneric obj %s 2>/dev/null",
+             local_if, bpf, local_if, bpf);
+    system(cmd);
+
+    if (setup_local(bpf) < 0) die("setup local");
+
+    for (int i = 0; i < num_wan; i++) {
+        if (setup_wan(i) < 0) die("setup wan");
+    }
+
+    printf("\n[RUNNING]\n");
+    printf("  %s -> %s (bypass kernel)\n", local_if, wan_if[selected_wan]);
+    printf("  Static route không ảnh hưởng!\n");
+    printf("  Ctrl+C to stop\n\n");
+
+    time_t last = 0;
     while (running) {
-        process_local_rx();
-
-        for (int i = 0; i < num_wan; i++) {
-            process_wan_rx(i);
-        }
-
+        process_rx();
         usleep(10);
 
         time_t now = time(NULL);
-        if (now - last_stats >= 5) {
-            print_stats();
-            last_stats = now;
+        if (now - last >= 3) {
+            printf("RX: %lu, TX: %lu\n", rx_count, tx_count);
+            last = now;
         }
     }
 
+    /* Detach XDP khi thoát */
+    snprintf(cmd, sizeof(cmd), "ip link set dev %s xdp off 2>/dev/null", local_if);
+    system(cmd);
+
     cleanup();
+    printf("XDP detached. Traffic back to kernel.\n");
     return 0;
 }
